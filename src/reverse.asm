@@ -1,416 +1,395 @@
-; Program do bajtowego odwracania zawartości pliku w assemblerze x86-64
-; Program jest w stanie odwracać duże pliki (ponad 4GiB) z jednoczesnym użyciem
-; niewielkiej ilości dodatkowej pamięci.
-
-; Strategia programu:
-; Dopóki nieodwrócona część pliku ma rozmiar >= 2MB:
-; Dokonaj zamiany (odwrócenia) pierwszego 1MB z ostatnim 1MB nieodwróconej części
-; Użyj sys_mmap do mapowania krańców pliku.
-; Kontynuuj aż nieodwrócona część będzie miała rozmiar < 2MB
-; Dla małej części (< 2MB): zmapuj całość i odwróć prostą pętlą.
-;
-; W przypadku napotkania jakiegokolwiek błędu funkcji systemowej
-; program natychmiast przerywa swoje działanie i ustawia sygnał wyjściowy na 1
-
 section .data
-  ; Stałe dla wywołań funkcji systemowych :
-  SYS_OPEN equ 2                ; otwieranie pliku
-  SYS_EXIT equ 60               ; zakończenie programu
-  SYS_FSTAT equ 5               ; pobieranie statystyk pliku
-  SYS_MMAP   equ 9              ; mapowanie części pliku do pamięci
-  SYS_MUNMAP equ 11             ; usuwanie mapowania pamięci
-  SYS_MSYNC  equ 26             ; synchronizacja zmian w zmapowanej pamięci
-  SYS_CLOSE  equ 3              ; zamykanie podanego pliku
+  ; System call constants :
+  SYS_OPEN equ 2                ; file open
+  SYS_EXIT equ 60               ; exit program
+  SYS_FSTAT equ 5               ; get file status
+  SYS_MMAP   equ 9              ; map file to memory
+  SYS_MUNMAP equ 11             ; unmap memory-mapped file
+  SYS_MSYNC  equ 26             ; synchronize changes in mapped memory to file
+  SYS_CLOSE  equ 3              ; close file
 
-  ; Parametry dla funkcji sys_mmap :
-  PROT_READ  equ 1              ; pozwolenie na czytanie
-  PROT_WRITE equ 2              ; pozwolenie na pisanie
-  MAP_SHARED equ 1              ; współdzielone mapowanie (zmiany widoczne w pliku)
+  ; parameters for sys_mmap :
+  PROT_READ  equ 1              ; permission to read
+  PROT_WRITE equ 2              ; permission to write
+  MAP_SHARED equ 1              ; shared mapping (changes visible in file)
 
-  ; Parametr dla sys_open :
-  O_RDWR equ 2                  ; informacja o możliwości czytania/pisania do pliku
+  ; parameter for sys_open :
+  O_RDWR equ 2                  ; open for reading and writing
 
-  ; Maski bitowe dla analizy typu pliku (wyciąganie informacji z sys_fstat)
-  S_IFMT    equ 0o170000        ; maska do izolowania typu pliku
-  S_IFREG   equ 0o100000        ; ciąg świadczący, że plik jest typu zwykłego
-                                ; czyli można go odwracać
+  ; bit masks for file types (from sys_stat structure) :
+  S_IFMT    equ 0o170000        ; mask for file type
+  S_IFREG   equ 0o100000        ; value indicating that the file is of regular type
+                                ; meaning it can be reversed
 
-  ; Stałe rozmiarów pamięci :
-  PAGE_SIZE equ 4096            ; standardowy rozmiar strony pamięci (4KB)
-  CHUNK_SIZE equ 0x100000       ; rozmiar bloku (krańca) do mapowania : 1MB
-
-
-section .bss
-    buforfstat resb 144         ; bufor na strukturę stat z sys_fstat
+  ; Constants for memory sizes :
+  PAGE_SIZE equ 4096            ; standard page size (4KB)
+  CHUNK_SIZE equ 0x100000       ; size of the mapped chunks (1MB)
 
 global _start
 
 section .text
     ; Local variables (kept on stack):
-    %define ptr_block_left          rbp - 8   ; użytkowy wskaźnik na początek lewego bloku
-                                              ; (odpowiadający miejscu od którego odwracamy krańce)
-    %define ptr_block_right         rbp - 16  ; użytkowy wskaźnik na blok prawy (jak wyżej)
-    %define ptr_block_right_orig    rbp - 24  ; oryginalny wskaźnik na blok prawy
-                                              ; (zwrócony przez sys_mmap)
-    %define ptr_block_left_orig     rbp - 32  ; oryginalny wskaźnik na blok lewy
-                                              ; (zwrócony przez sys_mmap)
-    %define size_block_left         rbp - 40  ; rozmiar lewego mapowania
-    %define size_block_right        rbp - 48  ; rozmiar prawego mapowania
-    %define stat_buffer             rbp - 192 ; bufor na strukturę stat z funkcji fstat (144 bajty)
+    %define ptr_block_left          rbp - 8   ; pointer to the start of the left block
+    %define ptr_block_right         rbp - 16  ; pointer to the start of the right block (as above)
+
+    %define ptr_block_right_orig    rbp - 24  ; original pointer to right block
+                                              ; (returned by sys_mmap)
+    %define ptr_block_left_orig     rbp - 32  ; original pointer to left block
+                                              ; (returned by sys_mmap)
+
+    %define size_block_left         rbp - 40  ; size of the left mapping
+    %define size_block_right        rbp - 48  ; size of the right mapping
+    %define stat_buffer             rbp - 192 ; buffer for the stat structure returned by fstat (144 bytes)
 
 _start:
     push rbp
     mov rbp, rsp
-    sub rsp, 192          ; rezerwujemy miejsce na zmienne lokalne, 144 na stat_buffer
-                          ; oraz 48 na wskaźniki i rozmiary bloków
+    sub rsp, 192          ; reserve space for local variables, 144 for stat_buffer
+                          ; and 48 for pointers and block sizes
 
-.otwieranie_pliku:
-    ; Parametry przekazywane do programu są na stosie o początku w rsp.
-    mov rcx, [rbp + 8]    ; Ładuje do rcx liczbę przekazanych parametrów
-    cmp rcx, 2            ; Sprawdzamy czy są tylko dwa parametry
-                          ; Przy czym pierwszy to będzie nazwa tego programu
-                          ; A drugi to nazwa pliku, który należy odwrócić.
-    jne .wyjdz_blad     ; Jeśli nie ma dwóch parametrów, to błąd.
+.open_file:
+    ; Parameters passed to the program are on the stack starting at rsp (rbp stores its initial value).
+    mov rcx, [rbp + 8]    ; Load into rcx the number of passed parameters
+    cmp rcx, 2            ; Check if there are only two parameters
+                          ; Where the first one will be the name of this program
+                          ; And the second is the name of the file to reverse.
+    jne .exit_error     ; If there aren't two parameters, error.
 
-    ; w [rsp + 16] przechowywana jest nazwa pliku do odwrócenia. Otwieramy go:
-    mov rax, SYS_OPEN     ; rax = informacja o użyciu sys_open
-    mov rdi, [rbp + 24]   ; rdi = nazwa podanego pliku.
-    mov rsi, O_RDWR       ; rsi = informacja o uprawnieniach (czytanie i pisanie)
-    mov rdx, 0            ; rdx = mode (0, czyli nieistotny)
-    syscall               ; wywołujemy sys_open o powyższych parametrach.
+    ; in [rbp + 24] the name of the file to reverse is stored. We open it:
+    mov rax, SYS_OPEN     ; rax = info about using sys_open
+    mov rdi, [rbp + 24]   ; rdi = name of the given file.
+    mov rsi, O_RDWR       ; rsi = info about permissions (reading and writing)
+    mov rdx, 0            ; rdx = mode (0, meaning irrelevant)
+    syscall               ; call sys_open with the above parameters.
 
-    ; jeśli sys_open zakończyło się niepowodzeniem to rax ma wartość ujemną
+    ; if sys_open ended with failure then rax has a negative value
     cmp rax, 0
-    jl .wyjdz_blad  ; jeśli rax < 0 to kończymy działanie (nie zamykamy pliku, bo się nie otworzył)
+    jl .exit_error   ; if rax < 0 then end execution (we don't close the file because it didn't open)
 
-    ; jeśli sys_open się powiodło, to w rax jest file descriptor, za jego
-    ; pomocą odwołujemy się do otwartego pliku.
-    mov r12, rax          ; w r12 przechowujemy file descriptor
+    ; if sys_open succeeded, then in rax is the file descriptor, by which
+    ; we refer to the opened file.
+    mov r12, rax                  ; in r12 we store the file descriptor
 
-; Po otwarciu pliku, sprawdzamy czy jest to plik "zywczajny" (możliwy do odwrócenia)
-; oraz jeśli tak to czy ma liczbę bajtów większą lub równą 2. Jeśli tak to
-; przechodzimy do odwracania pliku.
-.badanie_podanego_pliku:
-    ; zbieramy statystyki dotyczące pliku z użyciem sys_fstat:
+; After opening the file, we check if it's a "regular" file (possible to reverse)
+; and if so, whether it has a number of bytes greater than or equal to 2. If so then
+; we proceed to reversing the file.
+.check_file_properties:
+    ; gather statistics about the file using sys_fstat:
     mov rax, SYS_FSTAT
-    mov rdi, r12                  ; rdi = file descriptor (trzymany w r12)
-    lea rsi, [stat_buffer]     ; rsi = wskaźnik do buforu dla structa wynikowego
+    mov rdi, r12                  ; rdi = file descriptor (kept in r12)
+    lea rsi, [stat_buffer]        ; rsi = pointer to buffer for the result struct
     syscall
 
-    ; patrzymy czy udane:
+    ; check if successful:
     cmp rax, 0
-    jl .posprzataj_i_wyjdz          ; jeśli nieudane to zamykamy plik i kończymy
+    jl .cleanup_exit              ; if unsuccessful then close file and end
 
 
-    ; Sprawdzamy czy ten plik jest zwyczajnego typu
-    mov eax, [stat_buffer + 24] ; tu jest trzymany typ pliku
-    and eax, S_IFMT                ; wyodrębniamy typ pliku
-    cmp eax, S_IFREG               ; sprawdzamy czy zwyczajny
-    jne .posprzataj_i_wyjdz          ; jeśli nie to zamykami plik i kończymy
+    ; Check if this file is of regular type
+    mov eax, [stat_buffer + 24]   ; here the file type is stored
+    and eax, S_IFMT               ; isolate the file type
+    cmp eax, S_IFREG              ; check if regular
+    jne .cleanup_exit             ; if not then close file and end
 
-    ; Skoro tu jesteśmy to plik jest zwyczajny. Jeśli ma < 2 bajty nie odwracamy
-    ; rozmiar pliku jest przecowywany na miejscu 48 w zwróconej strukturze
-    mov r13, [stat_buffer + 48] ; zapisujemy rozmiar pliku do r13
+    ; Since we're here the file is regular. If it has < 2 bytes we don't reverse it.
+    ; file size is stored at position 48 in the returned structure
+    mov r13, [stat_buffer + 48]   ; save file size to r13
     cmp r13, 2
-    jb .sukces_wyjscie             ; jeśli ma mniej niż 2 bajty, sukces.
+    jb .success_exit              ; if it has less than 2 bytes, success.
 
-.inicjalizacja_przed_petla:
-    ; inicjalizacja wskaźników na początek i koniec pliku
-    mov r14, 0            ; start = r14 = 0 (pierwszy bajt)
-    mov r15, r13          ;
-    dec r15               ; r15 = end = rozmiar pliku - 1 (początek ostatniego bajtu)
+.init_pointers:
+    ; initialization of pointers to the start and end of the file
+    mov r14, 0                    ; start = r14 = 0 (first byte)
+    mov r15, r13                  ; end = r15 = file size
+    dec r15                       ; r15 = end = file size - 1 (start of the last byte)
 
-    ; Liczymy liczbę bajtów pomiędzy start i end (włącznie)
-    mov rax, r15          ; rax = end
-    sub rax, r14          ; rax = end - start
-    inc rax               ; rax = end - start + 1
-                          ; tyle jest bajtów pomiędzy start i end (włącznie)
+    ; Count the number of bytes between start and end (inclusively)
+    mov rax, r15                  ; rax = end
+    sub rax, r14                  ; rax = end - start
+    inc rax                       ; rax = end - start + 1
+                                  ; that's how many bytes are between start and end (inclusively)
 
-    ; sprawdzamy czy możemy pomapować LEWO (1MB) i PRAWO(1MB), tak żeby
-    ; części się na siebie nie nakładały :
+    ; check if we can map LEFT (1MB) and RIGHT(1MB), so that
+    ; the parts don't overlap :
     mov rdi, CHUNK_SIZE
-    shl rdi, 1              ; rdi = CHUNK_SIZE * 2
+    shl rdi, 1                    ; rdi = CHUNK_SIZE * 2
     cmp rax, rdi
-    jb .odwroc_maly_plik    ; jeśli mniejsze, to musimy skoczyć do odwracania
-                            ; małego pliku (części pliku, mającej mniej niż 2MB)
+    jb .reverse_small_part        ; if smaller, then we must jump to reversing
+                                  ; a small file (a part of the file, having less than 2MB)
 
-; Skoro tu jesteśmy to musimy odwracać po 1MB z przodu i tyłu aż nie uzyskamy
-; części środkowej mniejszej niż 2MB.
-.petla_glowna:
-    ; do sys_mmap, podany offset pliku musi być wielokrotnością PAGE_SIZE
-    ; musimy obliczyć odpowiednie wartości, które podamy do sys_mmap oraz
-    ; zapamiętać przesunięcia indeksów względem tych, od których chcemy zacząć
-    ; odwracanie. Ilustruje to następujący przykład (na mniejszą skalę):
-    ; chcemy zmapować bajty pliku od tego na miejscu nr 5 do tego na miejscu
-    ; numer 5000 (numerujemy od 0). Zatem offset pliku, który podamy do sys_mmap
-    ; bedzie wynosił 0, ponieważ jest to zaokrąglenie 5 w dół do wielokrotności
-    ; page_size. Zatem mapowanie odbędzie się od 0 do 5000 bajtu pliku, ale
-    ; my chcemy korzystać tylko z mapowania od 5 do 5000, dlatego
-    ; musimy zapamiętać:
+; Since we're here we must reverse 1MB from the front and back until we get
+; a middle part smaller than 2MB.
+.main_loop:
+    ; for sys_mmap, the given file offset must be a multiple of PAGE_SIZE
+    ; we must calculate the appropriate values that we'll pass to sys_mmap and
+    ; remember the index offsets relative to those from which we want to start
+    ; reversing. The following example illustrates this (on a smaller scale):
+    ; we want to map bytes from the one at position nr 5 to the one at position
+    ; number 5000 (we are indexing from 0). So the file offset we'll pass to sys_mmap
+    ; will be 0, because this is the rounding of 5 down to a multiple of
+    ; page_size. So we'll map 0 to 5000 bytes of the file, but
+    ; we want to use only the mapping from 5 to 5000, so
+    ; we must remember:
 
-    ; [ptr_block_left] -> użytkowy adres, początek zmapowanego bloku + przesunięcie
-    ;                   (dla przykładu przesunięcie wynosi 5).
-    ; [ptr_block_left_ORYGINALNY] -> adres początku zmapowanego bloku
-    ;                   (wartość rax po poprawnym wykonaniu sys_mmap)
-    ; [size_blok_left] -> długość mapowanego bloku (od 0 do 5000).
-    ; analogicznie dla bloków prawych.
+    ; [ptr_block_left] -> start of mapped block + shift
+    ;                   (in the example the shift equals 5).
+    ; [ptr_block_left_orig] -> address of the start of the mapped block
+    ;                   (value of rax after successful execution of sys_mmap)
+    ; [size_block_left] -> length of the mapped block (from 0 to 5000).
+    ; analogously for right blocks.
 
-    ; wyrównanie offsetu bloku lewego do wielokrotności PAGE_SIZE (w dół) :
-    mov rax, r14            ; rax = start
-    xor rdx, rdx            ; rdx = 0, czyszczenie
-    mov rcx, PAGE_SIZE      ; rcx = dzielnik = PAGE_SIZE
-    div rcx                 ; rax = start / PAGE_SIZE (podłoga z dzielenia)
-    mul rcx                 ; rax = (start / PAGE_SIZE) * PAGE_SIZE
-    ; teraz w rax jest offset pliku, który podajemy do sys_mmap
-    mov r9, rax             ; r9 = offset pliku
+    ; compute left offset and shift
+    mov rax, r14                      ; rax = start
+    xor rdx, rdx                      ; rdx = 0, clearing
+    mov rcx, PAGE_SIZE                ; rcx = divisor = PAGE_SIZE
+    div rcx                           ; rax = start / PAGE_SIZE (floor)
+    mul rcx                           ; rax = (start / PAGE_SIZE) * PAGE_SIZE
+    ; now, rax contains file offset that we pass to sys_mmap
+    mov r9, rax                       ; r9 = file offset
     mov rbx, r14
-    sub rbx, r9             ; rbx = start - offset pliku = przesunięcie
+    sub rbx, r9                       ; rbx = start - file offset = shift
 
-    ; mapowanie bloku LEWEGO
+    ; mapping the LEFT block
     mov rax, SYS_MMAP
-    mov rdi, 0              ; addr = NULL (domyślny)
+    mov rdi, 0                        ; addr = NULL (default)
     mov rsi, CHUNK_SIZE
-    add rsi, rbx            ; dlugosc mapowania = CHUNK_SIZE + przesuniecie
-    mov rdx,  PROT_READ | PROT_WRITE  ; zarówno czytamy, jak i piszemy
-    mov r10, MAP_SHARED     ; współdzielone mapowanie (zmiany widoczne w pliku)
-    mov r8, r12             ; r8 = r12 = file descriptor
-    ; r9 już trzyma offset pliku
+    add rsi, rbx                      ; mapping length = CHUNK_SIZE + shift
+    mov rdx,  PROT_READ | PROT_WRITE  ; both reading and writing
+    mov r10, MAP_SHARED               ; shared mapping (changes visible in file)
+    mov r8, r12                       ; r8 = r12 = file descriptor
+    ; r9 already holds the file offset
     syscall
 
-    ; w przypadku powodzenia, mmap zwraca (do rax) pointer na zmapowany obszar
-    ; ujemny rax jest błędem.
+    ; in case of success, mmap returns (to rax) a pointer to the mapped area
+    ; negative rax is an error.
     cmp rax, 0
-    jl .posprzataj_i_wyjdz    ; jeśli rax < 0 to błąd
+    jl .cleanup_exit                  ; if rax < 0 then error
 
-    ; jeśli powodzenie, to zapamiętujemy potrzebne dane
+    ; if success, then we remember the needed data
     mov [ptr_block_left_orig], rax
-    ; użytkowy adres otrzymamy poprzez dodanie przesunięcia do adresu z mapowania
-    add rax, rbx                ; dodajemy przesunięcie
+    add rax, rbx                      ; add shift
     mov [ptr_block_left], rax
-    ; rsi przechowuje CHUNK_SIZE + rbx (tak podaliśmy wywołując sys_mmap)
+    ; rsi holds CHUNK_SIZE + rbx (as we passed when calling sys_mmap)
     mov [size_block_left], rsi
 
 
-    ; mapowanie bloku PRAWEGO
-    ; musimy obliczyć początek bloku prawego w odwracanym pliku
-    ; będzie to wynosiło: end - CHUNK_SIZE + 1
-    mov r11, r15             ; r11 = end
-    sub r11, CHUNK_SIZE      ; r11 = end - CHUNK_SIZE
-    inc r11                  ; r11 = end - CHUNK_SIZE + 1
-    ;musimy go wyrównać w dół do PAGE_SIZE
+    ; mapping the RIGHT block
+    ; we must calculate the start of the right block in the file.
+    ; it will be: end - CHUNK_SIZE + 1
+    mov r11, r15                      ; r11 = end
+    sub r11, CHUNK_SIZE               ; r11 = end - CHUNK_SIZE
+    inc r11                           ; r11 = end - CHUNK_SIZE + 1
+    ;we must align it down to PAGE_SIZE
     mov rax, r11
     xor rdx, rdx
     mov rcx, PAGE_SIZE
-    div rcx                 ; rax = r11 / page_size (podłoga z dzielenia)
-    mul rcx                 ; rax = (r11 / PAGE_SIZE) * PAGE_SIZE
-    mov r9, rax             ; w r9 mamy teraz wyrównany offset
+    div rcx                           ; rax = r11 / page_size (floor)
+    mul rcx                           ; rax = (r11 / PAGE_SIZE) * PAGE_SIZE
+    mov r9, rax                       ; in r9 we now have the aligned offset
 
-    ; Liczymy ile bajtów "za wcześnie" mamy offset (obliczamy przesunięcie)
-    mov rbx, r11            ; r11 = oryginalny offset w pliku
-    sub rbx, r9             ; r9 = zaokrąglony w dół offset.
-    ; teraz rbx trzyma przesunięcie
+    ; Calculate how many bytes "too early" the offset is (calculate the shift)
+    mov rbx, r11                      ; r11 = original offset in the file
+    sub rbx, r9                       ; r9 = rounded down offset.
+    ; now rbx holds the shift
 
-    ; mapujemy blok prawy :
+    ; map the right block :
     mov rax, SYS_MMAP
     mov rdi, 0
     mov rsi, rbx
-    add rsi, CHUNK_SIZE     ; rsi = CHUNK_SIZE + przesunięcie (długość mapowania)
+    add rsi, CHUNK_SIZE               ; rsi = CHUNK_SIZE + shift (mapping length)
     mov rdx, PROT_READ | PROT_WRITE
     mov r10, MAP_SHARED
-    mov r8, r12             ; r8 = r12 = file descriptor
-    ; r9 już ma offset
+    mov r8, r12                       ; r8 = r12 = file descriptor
+    ; r9 already has the offset
     syscall
 
-    ; Jeśli się powiodło, to w rax trzymany jest adres na zmapowaną pamięć,
-    ; jeśli się nie powiodło to rax jest ujemny.
-    ; sprawdzamy czy się powiodło:
+    ; If it succeeded, then rax holds the address to the mapped memory,
+    ; if it didn't succeed then rax is negative.
     cmp rax, 0
-    jl .posprzataj_i_wyjdz    ; rax < 0, zakończ program
+    jl .cleanup_exit                  ; rax < 0, end program
 
-    mov [ptr_block_right_orig], rax   ; zapisujemy oryginalny wskaźnik
+    mov [ptr_block_right_orig], rax   ; save original pointer
     mov rsi, rbx
-    add rsi, CHUNK_SIZE     ; rsi = przesunięcie + CHUNK_SIZE
-    mov [size_block_right], rsi          ; zapisujemy długość mapowania
+    add rsi, CHUNK_SIZE               ; rsi = shift + CHUNK_SIZE
+    mov [size_block_right], rsi       ; save mapping length
 
-    add rax, rbx            ; przesuń adres mapowania o przesunięcie
-    mov [ptr_block_right], rax  ; zapisz użytkowy adres
+    add rax, rbx                      ; shift the mapping address by the shift
+    mov [ptr_block_right], rax        ; save address
 
 
-    ; W tej chwili mamy zmapowane bloki lewy i prawy, każdy o długości użytkowej
-    ; 1MB (przez zaokrąglenia, ich długość może być większa). Musimy
-    ; w pętli zamienić ze sobą odpowiednie bajty bloku lewego i prawego.
-    ; pętla zamiany bloków, wywołuje się CHUNK_SIZE razy, bo tyle wynosi
-    ; użytkowa długość każdego z bloków.
+    ; At this moment we have mapped left and right blocks, each with length
+    ; 1MB (due to rounding, their length may be greater). We must
+    ; swap corresponding bytes of the left and right block in a loop.
+    ; loop index i is kept in rcx.
     xor rcx, rcx           ; i = 0
 
-.petla_zamiana_blokow:
+.swap_blocks_loop:
     cmp rcx, CHUNK_SIZE
-    jge .po_zamianie       ; if i>=CHUNK_SIZE, koniec pętli
+    jge .after_swapping               ; if i>=CHUNK_SIZE, end of loop
 
-    ; Liczymy miejsca, które będą zamieniane
+    ; Calculate the places that will be swapped
     ; p = ptr_block_left + i
     ; q = ptr_block_right + CHUNK_SIZE - i - 1
     mov rsi, [ptr_block_left]
-    add rsi, rcx           ; rsi = p = ptrLEWY + i
+    add rsi, rcx                      ; rsi = p = ptr_block_left + i
 
     mov rax, CHUNK_SIZE
     sub rax, rcx
-    dec rax               ; rax = CHUNK_SIZE - i - 1
+    dec rax                           ; rax = CHUNK_SIZE - i - 1
     mov rdi, [ptr_block_right]
-    add rdi, rax          ; rdi = q = ptrPRAWY + CHUNK_SIZE - i - 1
+    add rdi, rax                      ; rdi = q = ptr_block_right + CHUNK_SIZE - i - 1
 
-    ; pozostało nam zamienić bajty
-    mov al, [rsi]         ; al to ostatni bajt z eax
-    mov ah, [rdi]         ; ah to przedostatni bajt z eax
+    ; swap the bytes
+    mov al, [rsi]                     ; al is the last byte of eax
+    mov ah, [rdi]                     ; ah is the second-to-last byte of eax
     mov [rsi], ah
     mov [rdi], al
 
     inc rcx
-    jmp .petla_zamiana_blokow
+    jmp .swap_blocks_loop
 
-.po_zamianie:
-    ; po zamianie bloków, musimy zrobić sys_msync dla każdego mapowania, żeby
-    ; być pewnym że zmiany się zaaplikowały
-    ; Musimy też usunąć mapowanie za pomocą sys_munmap
+.after_swapping:
+    ; after swapping blocks, we must do sys_msync for each mapping, to
+    ; be sure that the changes were applied
+    ; We must also remove the mapping using sys_munmap
 
-    ; sys_msync dla bloku lewego
+    ; sys_msync for the left block
     mov rax, SYS_MSYNC
-    mov rdi, [ptr_block_left_orig]      ; adres początkowy mapowania
-    mov rsi, [size_block_left]             ; długość mapowania
-    mov rdx, 0                                  ; brak specjalnych flag
+    mov rdi, [ptr_block_left_orig]          ; starting address of mapping
+    mov rsi, [size_block_left]              ; mapping length
+    mov rdx, 0                              ; no special flags
     syscall
-    ; jeśli niepowodzenie
     cmp rax, 0
-    jl .posprzataj_i_wyjdz                        ; rax < 0, kończymy z błędem.
+    jl .cleanup_exit                        ; rax < 0, end with error.
 
 
-    ; sys_msync dla bloku PRAWEGO
+    ; sys_msync for the RIGHT block
     mov rax, SYS_MSYNC
-    mov rdi, [ptr_block_right_orig]     ; adres początkowy mapowania
-    mov rsi, [size_block_right]            ; długość mapowania
-    mov rdx, 0                                  ; brak specjalnych flag
+    mov rdi, [ptr_block_right_orig]         ; starting address of mapping
+    mov rsi, [size_block_right]             ; mapping length
+    mov rdx, 0                              ; no special flags
     syscall
 
-    ; jeśli niepowodzenie zakończ z błędem
+    ; if failure, end with error
     cmp rax, 0
-    jl .posprzataj_i_wyjdz
+    jl .cleanup_exit
 
-    ; zwalniamy mapowania dla bloku LEWEGO z użyciem sys_munmap
+    ; free the mapping for the LEFT block using sys_munmap
     mov rax, SYS_MUNMAP
-    mov rdi, [ptr_block_left_orig]      ; adres początkowy mapowania
-    mov rsi, [size_block_left]             ; długość mapowania
+    mov rdi, [ptr_block_left_orig]          ; starting address of mapping
+    mov rsi, [size_block_left]              ; mapping length
     syscall
 
-    ; gdy niepowodzenie, zakończ z błędem
+    ; when failure, end with error
     cmp rax, 0
-    jl .posprzataj_i_wyjdz
+    jl .cleanup_exit
 
-    ; zwalniamy mapowania dla bloku PRAWEGO z uzyiem sys_munmap
+    ; free the mapping for the RIGHT block using sys_munmap
     mov rax, SYS_MUNMAP
     mov rdi, [ptr_block_right_orig]
     mov rsi, [size_block_right]
     syscall
 
-    ; w przypadku niepowodzenia, zakończ z błędem
+    ; in case of failure, end with error
     cmp rax, 0
-    jl .posprzataj_i_wyjdz
+    jl .cleanup_exit
 
-.operacje_koncowe_glownej_petli:
-    ; musimy zaktualizować start i end
-    add r14, CHUNK_SIZE                     ; start += CHUNK_SIZE
-    sub r15, CHUNK_SIZE                     ; end -= CHUNK_SIZE
+.main_loop_continue:
+    ; we must update start and end
+    add r14, CHUNK_SIZE                    ; start += CHUNK_SIZE
+    sub r15, CHUNK_SIZE                    ; end -= CHUNK_SIZE
 
-    ; liczymy ile jest nieodwróconych bajtów pomiędzy start i end (włącznie)
+    ; count how many unreversed bytes are between start and end (inclusively)
     mov rax, r15
     sub rax, r14
-    inc rax                                 ; rax = end - start + 1
+    inc rax                                ; rax = end - start + 1
 
-    ; sprawdzamy czy bajtów środka jest >= 2 * CHUNK_SIZE
+    ; check if there is >= (2 * CHUNK_SIZE) of bytes left to reverse
     mov rsi, CHUNK_SIZE
     shl rsi, 1
     cmp rax, rsi
-    jge .petla_glowna                       ; jeśli tak, to kolejny obieg pętli
+    jge .main_loop                         ; if so, then next iteration of the loop
 
-; Jeśli tu jesteśmy, to potencjalnie została niewielka (< 2MB)  nieodwrócona
-; część pliku pośrodku.
+; If we're here, then potentially there's a small (< 2MB) unreversed
+; part of the file in the middle.
 
-.odwroc_maly_plik:
-    ; liczymy ile jest bajtów nieodwróconej części
+.reverse_small_part:
+    ; count how many bytes of the unreversed part there are
     mov rax, r15
     sub rax, r14
-    inc rax           ; rax = r15 - r14 + 1
-    ; rax ma teraz rozmiar części, którą pozostało odwrócić
+    inc rax                                ; rax = r15 - r14 + 1
+    ; rax now has the size of the part that remains to be reversed
 
-    ; gdy liczba bajtów środka jest mniejsza lub równa 1, nic nie robimy.
+    ; when the number of middle bytes is less than or equal to 1, do nothing.
     cmp rax, 1
-    jle .sukces_wyjscie ;
+    jle .success_exit ;
 
-    mov rbx, rax      ; rbx, ma teraz rozmiar części, którą pozostało odwrócić
+    mov rbx, rax      ; rbx, now has the size of the part that remains to be reversed
 
-    ; Musimy zmapować pozostałą całość, ale najpierw tak jak wcześniej,
-    ; zaokrąglamy offset pliku do wielokrotności page_size
+    ; We must map the remaining area, but first just like before,
+    ; we round the file offset to a multiple of page_size
     mov rax, r14                           ; rax = start
     xor rdx, rdx                           ; rdx = 0
     mov rcx, PAGE_SIZE                     ; rcx = PAGE_SIZE
-    div rcx                                ; rax = start / PAGE_SIZE (podłoga)
+    div rcx                                ; rax = start / PAGE_SIZE (floor)
     mul rcx                                ; rax *= PAGE_SIZE
-    mov r9, rax                            ; r9 trzyma wyrównany offset
+    mov r9, rax                            ; r9 holds the aligned offset
 
     mov rsi, r14
-    sub rsi, r9       ; rsi = start - wyrównany offset = przesunięcie
+    sub rsi, r9       ; rsi = start - aligned offset = shift
 
-    ; długość mapowania = przesunięcie + długość środka
-    mov rax, rsi      ; rax = przesunięcie
-    add rax, rbx      ; rax = przesunięcie + rozmiar środka
+    ; mapping length = shift + length
+    mov rax, rsi      ; rax = shift
+    add rax, rbx      ; rax = shift + length
 
-    mov [size_block_left], rax       ; zapisujemy rozmiar bloku
+    mov [size_block_left], rax            ; save block size
 
-    ; mapujemy blok (traktujemy go jak lewy)
+    ; map the block (we are treating it as the left block)
     mov rax, SYS_MMAP
     mov rdi, 0
-    mov rsi, [size_block_left]       ; długość całkowita
+    mov rsi, [size_block_left]            ; total length
     mov rdx, PROT_READ | PROT_WRITE
     mov r10, MAP_SHARED
-    mov r8, r12                           ; w r12 jest file descriptor
-    ; r9 już przechowuje wyrównany offset
+    mov r8, r12                           ; r12 contains the file descriptor
+    ; r9 already holds the aligned offset
     syscall
 
-    ; w przypadku niepowodzenia wychodzimy z kodem 1
+    ; in case of failure we exit with code 1
     cmp rax, 0
-    jl .posprzataj_i_wyjdz
+    jl .cleanup_exit
 
-    ; jeśli mapowanie się powiodło to rax = adres mapowania
-    ; tak jak w pętli głównej zapisujemy adres mapowania
+    ; if mapping succeeded then rax = mapping address
+    ; just like in the main loop we save the mapping address
     mov [ptr_block_left_orig], rax
     add rax, r14                          ; rax += start
-    sub rax, r9                           ; rax -= wyrównany offset
-    mov [ptr_block_left], rax           ; użytkowy adres
+    sub rax, r9                           ; rax -= aligned offset
+    mov [ptr_block_left], rax             ; user address
 
-    ; odwracamy w pętli bajty bloku.
-    mov rdx, rbx                          ; rdx = rbx = rozmiar obracanego obszaru
-    shr rdx, 1                            ; rdx = rozmiar obszaru / 2
-    xor rcx, rcx                          ; i = 0, tym iterujemy
+    ; reverse the block bytes in a loop.
+    mov rdx, rbx                          ; rdx = rbx = size of the area being reversed
+    shr rdx, 1                            ; rdx = area size / 2
+    xor rcx, rcx                          ; i = 0, we iterate with this
 
-.petla_odwroc_srodek:
-    cmp rcx, rdx                          ; if( i >= dlugosc / 2) koniec pętli
-    jge .po_odwroceniu_srodka
+.reverse_center_loop:
+    cmp rcx, rdx                          ; if( i >= length / 2) end of loop
+    jge .after_center_reverse
 
-    ; zamieniamy bity p i q :
+    ; swap bytes p and q :
     ; p = [ptr_block_left] + i
-    ; q = [ptr_block_left] + długość obszaru - i - 1
+    ; q = [ptr_block_left] + area length - i - 1
 
-    ; obliczamy p
-    mov rsi, [ptr_block_left]           ; p = [ptr_block_left]
+    ; calculate p
+    mov rsi, [ptr_block_left]             ;p = [ptr_block_left]
     add rsi, rcx                          ; rsi = p = [ptr_block_left] + i
 
-    ; obliczamy q
-    mov rax, rbx                          ; rax = długość obszaru
-    sub rax, rcx                          ; rax = długość obszaru - i
-    dec rax                               ; rax = długość obszaru - i - 1
-    mov rdi, [ptr_block_left]           ; rdi = [ptr_block_left]
-    add rdi, rax                          ; rdi = q = [ptr_block_left] - rax
+    ; calculate q
+    mov rax, rbx                          ; rax = area length
+    sub rax, rcx                          ; rax = area length - i
+    dec rax                               ; rax = area length - i - 1
+    mov rdi, [ptr_block_left]             ; rdi = [ptr_block_left]
+    add rdi, rax                          ; rdi = q = [ptr_block_left] + rax
 
-    ; zamiana bajtów
+    ; swap bytes
     mov al, [rsi]
     mov ah, [rdi]
     mov [rsi], ah
@@ -418,59 +397,59 @@ _start:
 
     ; i++
     inc rcx
-    jmp .petla_odwroc_srodek
+    jmp .reverse_center_loop
 
-.po_odwroceniu_srodka:
-    ; musimy zsynchronizować zmiany używając sys_msync
+.after_center_reverse:
+    ; we must synchronize the changes using sys_msync
     mov rax, SYS_MSYNC
-    mov rdi, [ptr_block_left_orig] ; adres mapowania
-    mov rsi, [size_block_left]        ; długość mapowania
-    mov rdx, 0                             ; brak specjalnych flag
+    mov rdi, [ptr_block_left_orig]         ; mapping address
+    mov rsi, [size_block_left]             ; mapping length
+    mov rdx, 0                             ; no special flags
     syscall
 
     cmp rax, 0
-    jl .posprzataj_i_wyjdz                   ; jeśli się nie powiodło, wyjdź z 1
+    jl .cleanup_exit                       ; if it didn't succeed, exit with 1
 
-    ; usuwamy mapowanie środka
+    ; remove the middle mapping
     mov rax, SYS_MUNMAP
-    mov rdi, [ptr_block_left_orig] ; adres mapowania
-    mov rsi, [size_block_left]        ; długość mapowania
+mov rdi, [ptr_block_left_orig]             ; mapping address
+    mov rsi, [size_block_left]             ; mapping length
     syscall
 
     cmp rax, 0
-    jl .posprzataj_i_wyjdz                   ; jeśli błąd to wyjdź
+    jl .cleanup_exit                       ; if error, then exit
 
-; mamy różne scenariusze zakończeń programu:
-; 1) plik się otworzył, wszystko pomyślnie, trzeba plik zamknąć i
-; zakończyć program z sygnałem 0
-.sukces_wyjscie:
+; we have different program termination scenarios:
+; 1) file opened, everything successful, we have to close the file and
+; end program with signal 0
+.success_exit:
 
-    ; zamykamy plik
+    ; close the file
     mov rax, SYS_CLOSE
-    mov rdi, r12                           ; deskryptor pliku
+    mov rdi, r12                           ; file descriptor
     syscall
-    cmp rax, 0                             ; jeśli się nie powiodło to błąd.
-    jl .wyjdz_blad
+    cmp rax, 0                             ; if it didn't succeed then error.
+    jl .exit_error
 
     mov rax, SYS_EXIT
-    xor rdi, rdi                           ; rdi = 0 (kod na wyjście)
+    xor rdi, rdi                           ; rdi = 0 (exit code)
 
     mov rsp, rbp
     pop rbp
 
     syscall
 
-; 2) plik się otworzył, ale coś w międzyczasie poszło nie tak
-.posprzataj_i_wyjdz:
-    ; zamknij plik
+; 2) file opened, but something went wrong in the meantime
+.cleanup_exit:
+    ; close file
     mov rax, SYS_CLOSE
     mov rdi, r12
     syscall
-; przechodzimy niżej do zakończenia programu z sygnałem 1
+; proceed below to end program with signal 1
 
-; 3) jeśli błąd stwierdzono przed / w trakcie otwierania pliku lub podczas zamykania
-.wyjdz_blad:
-    ; wychodzimy z sygnałem 1 (błąd)
+; 3) if error was detected before / during file opening or during closing
+.exit_error:
+    ; exit with signal 1 (error)
     mov rax, SYS_EXIT
     mov rdi, 1
 
