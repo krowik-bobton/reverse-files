@@ -1,6 +1,6 @@
 # File Reverser (x86-64 Assembly)
 
-Low-level Assembly script for reversing file contents with
+Low-level Assembly program for reversing file contents with
 low RAM usage. Designed for educational purposes.
 
 ## Key features
@@ -32,7 +32,10 @@ low RAM usage. Designed for educational purposes.
    ./reverse <path_to_file>
    ```
 **Note:** if number of paths to files is 0 or more than 1, program exits with a status code of `1` (error)
-
+3. If you want to delete files added by Makefile, simply type:
+  ```bash
+  make clean
+  ```
 
 ## Future Optimizations
 1. The current version iteratively swaps single bytes. Performance could be improved by swapping entire 64-bit registers (after reversing them with `bswap`).
