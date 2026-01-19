@@ -4,7 +4,7 @@ Low-level Assembly script for reversing file contents with
 low RAM usage. Designed for educational purposes.
 
 ## Key features
-* **Low resource usage:** Despite the size of the provided file, program uses constant RAM (~2MB for mapped memory blocks).
+* **Low resource usage:** Despite possibly huge size of the provided file, program uses constant RAM (~2MB for mapped memory blocks).
 * **Linux syscalls:** Directly invokes Linux system calls: `sys_mmap`, `sys_msync`, `sys_fstat`.
 
 ## Applied strategy
@@ -21,6 +21,18 @@ low RAM usage. Designed for educational purposes.
    * Any system call failure results in an immediate termination.
    * If provided file isn't reversible (e.g. directory), program signals an error.
    * The program exits with a status code of `1` to signal an error.
+
+## How to use
+1. Make executable file `reverse` using provided Makefile by typing following line in the terminal:
+   ```bash
+   make
+   ```
+2. Execute the program with the target path as an argument. 
+   ```bash
+   ./reverse <path_to_file>
+   ```
+**Note:** if number of paths to files is 0 or more than 1, program exits with a status code of `1` (error)
+
 
 ## Future Optimizations
 1. The current version iteratively swaps single bytes. Performance could be improved by swapping entire 64-bit registers (after reversing them with `bswap`).
