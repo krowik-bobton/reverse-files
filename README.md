@@ -31,7 +31,8 @@ low RAM usage. Designed for educational purposes.
    ```bash
    ./reverse <path_to_file>
    ```
-**Note:** if number of paths to files is 0 or more than 1, program exits with a status code of `1` (error)
+  **Note:** if number of paths to files is 0 or more than 1, program exits with a status code of `1` (error)
+
 3. If you want to delete files added by Makefile, simply type:
   ```bash
   make clean
