@@ -1,7 +1,7 @@
 # File Reverser (x86-64 Assembly)
 
 Low-level Assembly program for reversing file contents with
-low RAM usage. Designed for educational purposes.
+low RAM usage. Designed for educational purposes to deepen understanding of I/O operations and memory management
 
 ## Key features
 * **Low resource usage:** Despite possibly huge size of the provided file, program uses constant RAM (~2MB for mapped memory blocks).
